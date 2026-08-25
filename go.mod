@@ -15,6 +15,7 @@ require (
 	github.com/smartass08/aria2go v0.0.0-00010101000000-000000000000
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/api v0.293.0
+	modernc.org/sqlite v1.21.1
 )
 
 require (
@@ -59,7 +60,6 @@ require (
 	modernc.org/mathutil v1.5.0 // indirect
 	modernc.org/memory v1.5.0 // indirect
 	modernc.org/opt v0.1.3 // indirect
-	modernc.org/sqlite v1.21.1 // indirect
 	modernc.org/strutil v1.1.3 // indirect
 	modernc.org/token v1.0.1 // indirect
 )

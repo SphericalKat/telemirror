@@ -24,6 +24,7 @@ import (
 
 	"github.com/SphericalKat/telemirror/internal/drive"
 	"github.com/SphericalKat/telemirror/internal/engine"
+	"github.com/SphericalKat/telemirror/internal/storage"
 	"github.com/SphericalKat/telemirror/internal/telegram"
 )
 
@@ -37,10 +38,6 @@ type Downloader interface {
 	// in FollowedBy.
 	AddURL(rawURL string, opts *engine.AddOptions) (string, error)
 
-	// Cancel removes a queued or active download. A queued download
-	// disappears without a stop event; an active download is stopped and
-	// reports one.
-	Cancel(gid string) error
 	// AddMagnet queues a BitTorrent magnet download in opts.Dir and
 	// returns the GID of the metadata download. Its completion event
 	// carries the GID of the download that holds the real files in
@@ -50,8 +47,10 @@ type Downloader interface {
 	// Status returns the current snapshot of one download.
 	Status(gid string) (engine.DownloadInfo, error)
 
-	// Cancel removes a queued or active download. An unknown GID reports
-	// an error that matches engine.ErrNotFound.
+	// Cancel removes a queued or active download. A queued download
+	// disappears without a stop event; an active download is stopped and
+	// reports one. An unknown GID reports an error that matches
+	// engine.ErrNotFound.
 	Cancel(gid string) error
 
 	// Events returns the lifecycle event stream for all downloads.
@@ -67,12 +66,23 @@ type Publisher interface {
 // Lister browses the configured Drive destination. The Drive lister
 // implements it.
 type Lister interface {
-	// List returns the direct children of the configured Drive folder
-	// whose names contain fileName, newest first, at most 20.
 	List(ctx context.Context, fileName string) ([]drive.Child, error)
-
-	// FolderLink returns the link to the configured Drive folder.
 	FolderLink() string
+}
+
+// Store persists mirror requests across restarts. The SQLite store in the
+// storage package implements it. A nil Store disables persistence; store
+// errors are logged and never stop mirroring.
+type Store interface {
+	// Save inserts or updates one stored mirror request.
+	Save(req storage.StoredRequest) error
+
+	// Delete removes the stored mirror request for one download
+	// directory.
+	Delete(dir string) error
+
+	// Load returns every stored mirror request, oldest first.
+	Load() ([]storage.StoredRequest, error)
 }
 
 // Config holds the settings the mirror service needs.
@@ -117,6 +127,10 @@ type Config struct {
 	// command live before the bot removes them. Zero means the upstream
 	// lifetime of 10 seconds.
 	TemporaryReplyDeleteDelay time.Duration
+
+	// Store persists queued and active mirror requests so they resume
+	// after a restart. Nil disables persistence.
+	Store Store
 }
 
 // Message lifetimes follow the upstream bot: temporary replies disappear
@@ -127,20 +141,25 @@ const (
 	temporaryReplyDeleteDelay = 10 * time.Second
 	statusDeleteDelay         = 10 * time.Second
 	defaultStatusMessageTTL   = 60 * time.Second
+	listReplyDeleteDelay      = 60 * time.Second
 )
 
 // unauthorizedMessage is the upstream response for commands from senders
 // who may not use the bot.
 const unauthorizedMessage = "You aren't authorized to use this bot here."
 
+// interruptedUploadMessage replies to a mirror request whose Drive upload
+// was in progress when the bot stopped. The upload is not retried after a
+// restart, so the request is marked failed instead.
+const interruptedUploadMessage = "Upload failed. Interrupted by a restart."
+
 // Upstream access codes, ordered from strongest to weakest control.
 const (
-	authSudo             = 0 // A configured sudo user.
-	authOwner            = 1 // The download owner replying to the request.
-	authChatAdmins       = 2 // A member of an authorized chat where all members administrate.
-	authChatMember       = 3 // A member of an authorized chat with an unknown role.
-	authDenied           = -1
-	listReplyDeleteDelay = 60 * time.Second
+	authSudo       = 0 // A configured sudo user.
+	authOwner      = 1 // The download owner replying to the request.
+	authChatAdmins = 2 // A member of an authorized chat where all members administrate.
+	authChatMember = 3 // A member of an authorized chat with an unknown role.
+	authDenied     = -1
 )
 
 // Service is the central mirror service.
@@ -221,7 +240,7 @@ func (r *record) hasStarted() bool {
 	return r.downloadStarted
 }
 
-// isUploading reports whether the record's result is being uploaded.
+// isUploading reports whether the result is being published now.
 func (r *record) isUploading() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -324,10 +343,14 @@ func New(cfg Config, tg telegram.Client, dl Downloader, pub Publisher, lister Li
 }
 
 // Run consumes download events and refreshes status messages until ctx is
-// cancelled or the event stream closes. Run blocks; call it once.
+// cancelled or the event stream closes. Run blocks; call it once. Run
+// first restores the mirror requests a previous process stored, when a
+// store is configured.
 func (s *Service) Run(ctx context.Context) error {
 	events, stop := s.dl.Events()
 	defer stop()
+
+	s.recoverStoredRequests(ctx)
 
 	ticker := time.NewTicker(s.cfg.StatusUpdateInterval)
 	defer ticker.Stop()
@@ -360,8 +383,6 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 
 	// Group chats may require the configured bot username after a command.
 	// Command matching is case-insensitive, like the upstream bot.
-	// /list stays available without the username, so every bot in a group
-	// can answer file searches.
 	if s.cfg.CommandsUseBotName && msg.Chat.Type != "private" &&
 		command != "list" && !strings.EqualFold(suffix, s.requiredBotName()) {
 		return
@@ -405,13 +426,13 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 		s.handleCancelAll(ctx, msg)
 	case "list":
 		if !s.isAuthorized(msg) {
-			s.sendTemporaryReply(ctx, msg, "You aren't authorized to use this bot here.")
+			s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
 			return
 		}
 		s.handleList(ctx, msg, arg)
 	case "getfolder":
 		if !s.isAuthorized(msg) {
-			s.sendTemporaryReply(ctx, msg, "You aren't authorized to use this bot here.")
+			s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
 			return
 		}
 		s.handleGetFolder(ctx, msg, arg)
@@ -464,6 +485,7 @@ func (s *Service) handleMirror(ctx context.Context, msg *telegram.Message, url s
 	}
 	rec.gid = gid
 	s.records[gid] = rec
+	s.saveStored(rec)
 	s.recMu.Unlock()
 
 	log.Printf("mirror: gid %s download %s", gid, url)
@@ -697,6 +719,7 @@ func (s *Service) handleComplete(ctx context.Context, rec *record) {
 	size := info.TotalLength
 
 	rec.setUploading(true)
+	s.saveStoredIfTracked(rec)
 	s.refreshStatuses()
 
 	if s.filenameDisallowed(name) {
@@ -752,6 +775,7 @@ func (s *Service) followDownload(ctx context.Context, rec *record, childGID stri
 	delete(s.records, rec.gid)
 	rec.gid = childGID
 	s.records[childGID] = rec
+	s.saveStored(rec)
 	s.recMu.Unlock()
 
 	child, err := s.dl.Status(childGID)
@@ -778,6 +802,125 @@ func stoppedMessage(rec *record) string {
 	return "Download stopped."
 }
 
+// recoverStoredRequests restores the mirror requests a previous process
+// stored, oldest first. An upload that was in progress when the bot stopped
+// is marked failed; every other stored request resumes through the download
+// engine and receives a fresh status message in its origin chat. Storage
+// errors only log a warning, so recovery never stops the service.
+func (s *Service) recoverStoredRequests(ctx context.Context) {
+	if s.cfg.Store == nil {
+		return
+	}
+	saved, err := s.cfg.Store.Load()
+	if err != nil {
+		log.Printf("mirror: load stored requests: %v", err)
+		return
+	}
+	for _, req := range saved {
+		s.recoverStoredRequest(ctx, req)
+	}
+}
+
+// recoverStoredRequest resumes one stored mirror request after a restart.
+func (s *Service) recoverStoredRequest(ctx context.Context, saved storage.StoredRequest) {
+	rec := &record{
+		gid:             saved.GID,
+		url:             saved.URL,
+		dir:             saved.Dir,
+		chatID:          saved.ChatID,
+		messageID:       saved.MessageID,
+		userID:          saved.UserID,
+		username:        saved.Username,
+		repliedUsername: saved.RepliedUsername,
+		started:         saved.Started,
+		tar:             saved.Tar,
+	}
+
+	if saved.Uploading {
+		// The interrupted upload is not retried after a restart, so the
+		// request is marked failed instead.
+		log.Printf("mirror: gid %s upload interrupted by a restart; marking failed", saved.GID)
+		rec.gid = ""
+		s.finish(ctx, rec, interruptedUploadMessage)
+		return
+	}
+
+	// Re-add the download to the engine under the record lock, like a
+	// fresh request, so an event that arrives during AddURL cannot run
+	// before the record exists. The engine resumes the download in the
+	// request's original directory.
+	s.recMu.Lock()
+	var gid string
+	var err error
+	if isMagnetURI(saved.URL) {
+		gid, err = s.dl.AddMagnet(saved.URL, &engine.AddOptions{Dir: rec.dir})
+	} else {
+		gid, err = s.dl.AddURL(saved.URL, &engine.AddOptions{Dir: rec.dir})
+	}
+	if err != nil {
+		s.recMu.Unlock()
+		log.Printf("mirror: recover download %s: %v", saved.URL, err)
+		rec.gid = ""
+		s.finish(ctx, rec, fmt.Sprintf("Failed to start the download. %v", err))
+		return
+	}
+	rec.gid = gid
+	s.records[gid] = rec
+	s.saveStored(rec)
+	s.recMu.Unlock()
+
+	log.Printf("mirror: recovered gid %s download %s", gid, saved.URL)
+	s.sendStatusMessage(context.WithoutCancel(ctx), rec)
+}
+
+// saveStored persists one mirror request for restart recovery. The caller
+// must hold recMu or have verified that the record is still tracked, so a
+// request that finished in the meantime cannot come back as a stored
+// request. Storage failures only log a warning.
+func (s *Service) saveStored(rec *record) {
+	if s.cfg.Store == nil {
+		return
+	}
+	err := s.cfg.Store.Save(storage.StoredRequest{
+		GID:             rec.gid,
+		URL:             rec.url,
+		Dir:             rec.dir,
+		ChatID:          rec.chatID,
+		MessageID:       rec.messageID,
+		UserID:          rec.userID,
+		Username:        rec.username,
+		RepliedUsername: rec.repliedUsername,
+		Started:         rec.started,
+		Tar:             rec.tar,
+		Uploading:       rec.isUploading(),
+	})
+	if err != nil {
+		log.Printf("mirror: save stored request: %v", err)
+	}
+}
+
+// saveStoredIfTracked persists one mirror request while it is still
+// tracked, so a request that finished first is stored no more.
+func (s *Service) saveStoredIfTracked(rec *record) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	if _, tracked := s.records[rec.gid]; !tracked {
+		return
+	}
+	s.saveStored(rec)
+}
+
+// deleteStored removes one mirror request from storage. The caller must
+// hold recMu. Storage failures only log a warning.
+func (s *Service) deleteStored(dir string) {
+	if s.cfg.Store == nil {
+		return
+	}
+	if err := s.cfg.Store.Delete(dir); err != nil {
+		log.Printf("mirror: delete stored request: %v", err)
+	}
+}
+
 // handleFailure reports a failed download with the engine error details.
 func (s *Service) handleFailure(ctx context.Context, rec *record) {
 	message := "Failed to download."
@@ -802,6 +945,7 @@ func (s *Service) finish(ctx context.Context, rec *record, message string) {
 		delete(s.records, rec.gid)
 	}
 	remaining := len(s.records)
+	s.deleteStored(rec.dir)
 	s.recMu.Unlock()
 
 	if !rec.cancelNotifiedChat() {
@@ -969,18 +1113,15 @@ func isMagnetURI(input string) bool {
 // sendTemporaryReply replies to a command message and removes both messages
 // after the temporary reply lifetime.
 func (s *Service) sendTemporaryReply(ctx context.Context, msg *telegram.Message, text string) {
-	s.replyWithLifetime(ctx, msg, text, temporaryReplyDeleteDelay)
+	s.replyWithLifetime(ctx, msg, text, s.replyDeleteDelay())
 }
 
-// sendListReply replies to a command message and removes both messages after
-// the longer lifetime the upstream bot gives /list results and /getFolder
-// links.
+// sendListReply replies to a command message and keeps the result visible for
+// the longer upstream lifetime used by Drive browsing commands.
 func (s *Service) sendListReply(ctx context.Context, msg *telegram.Message, text string) {
 	s.replyWithLifetime(ctx, msg, text, listReplyDeleteDelay)
 }
 
-// replyWithLifetime sends a reply to the command message and removes both
-// messages after delay.
 func (s *Service) replyWithLifetime(ctx context.Context, msg *telegram.Message, text string, delay time.Duration) {
 	sent, err := s.tg.SendMessage(ctx, msg.Chat.ID, text, msg.MessageID)
 	if err != nil {

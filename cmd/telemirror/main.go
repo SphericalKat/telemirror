@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/SphericalKat/telemirror/internal/drive"
 	"github.com/SphericalKat/telemirror/internal/engine"
 	"github.com/SphericalKat/telemirror/internal/mirror"
+	"github.com/SphericalKat/telemirror/internal/storage"
 	"github.com/SphericalKat/telemirror/internal/telegram"
 )
 
@@ -29,6 +31,43 @@ const (
 // maxConcurrentDownloads matches the upstream aria2 configuration.
 const maxConcurrentDownloads = 3
 
+// openStore opens the storage database. It returns nil when no database
+// path is configured or when the database cannot be opened or migrated,
+// after logging a warning; the bot then runs with in-memory state only.
+func openStore(path string) *storage.Store {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	store, err := storage.Open(path)
+	if err != nil {
+		log.Printf("telemirror: storage disabled, continuing with in-memory state: %v", err)
+		return nil
+	}
+	return store
+}
+
+// mirrorConfig builds the mirror service configuration. The store is set
+// only when it is not nil, because a typed-nil store would not compare
+// equal to a nil interface value and would enable persistence without a
+// working database.
+func mirrorConfig(cfg config.Config, store *storage.Store) mirror.Config {
+	out := mirror.Config{
+		SudoUsers:            cfg.SudoUsers,
+		AuthorizedChats:      cfg.AuthorizedChats,
+		DownloadDir:          cfg.DownloadDir,
+		FilteredDomains:      cfg.FilteredDomains,
+		FilteredFilenames:    cfg.FilteredFilenames,
+		StatusUpdateInterval: time.Duration(cfg.StatusUpdateIntervalMS) * time.Millisecond,
+		CommandsUseBotName:   cfg.CommandsUseBotName,
+		CommandBotName:       cfg.CommandBotName,
+		IsTeamDrive:          cfg.IsTeamDrive,
+	}
+	if store != nil {
+		out.Store = store
+	}
+	return out
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -40,11 +79,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	lister, err := drive.NewLister(driveService, drive.Config{ParentFolderID: cfg.GDriveParentDirID})
+	if err != nil {
+		return err
+	}
 	if cfg.TelegramToken == "" {
 		return errors.New("telegram_token must be set in the environment or a configuration file")
 	}
 	if cfg.GDriveParentDirID == "" {
 		return errors.New("gdrive_parent_dir_id must be set in the environment or a configuration file")
+	}
+
+	store := openStore(cfg.DatabasePath)
+	if store != nil {
+		defer store.Close()
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -73,10 +121,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	lister, err := drive.NewLister(driveService, drive.Config{ParentFolderID: cfg.GDriveParentDirID})
-	if err != nil {
-		return err
-	}
 
 	eng, err := engine.New(engine.Config{
 		DownloadDir:   cfg.DownloadDir,
@@ -87,17 +131,7 @@ func run() error {
 	}
 
 	api := telegram.NewAPI(cfg.TelegramToken, nil)
-	service, err := mirror.New(mirror.Config{
-		SudoUsers:            cfg.SudoUsers,
-		AuthorizedChats:      cfg.AuthorizedChats,
-		DownloadDir:          cfg.DownloadDir,
-		FilteredDomains:      cfg.FilteredDomains,
-		FilteredFilenames:    cfg.FilteredFilenames,
-		StatusUpdateInterval: time.Duration(cfg.StatusUpdateIntervalMS) * time.Millisecond,
-		CommandsUseBotName:   cfg.CommandsUseBotName,
-		CommandBotName:       cfg.CommandBotName,
-		IsTeamDrive:          cfg.IsTeamDrive,
-	}, api, eng, publisher, lister)
+	service, err := mirror.New(mirrorConfig(cfg, store), api, eng, publisher, lister)
 	if err != nil {
 		return err
 	}

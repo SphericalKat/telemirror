@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,11 @@ type harness struct {
 	lister      *fakeLister
 	svc         *mirror.Service
 	downloadDir string
+
+	stopMu  sync.Mutex
+	stopped bool
+	cancel  context.CancelFunc
+	done    <-chan error
 }
 
 func newHarness(t *testing.T, mutate func(*mirror.Config)) *harness {
@@ -49,16 +55,27 @@ func newHarness(t *testing.T, mutate func(*mirror.Config)) *harness {
 	done := make(chan error, 1)
 	go func() { done <- svc.Run(ctx) }()
 
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Error("service Run did not return after cancellation")
-		}
-	})
+	h := &harness{tg: tg, dl: dl, pub: pub, lister: lister, svc: svc, downloadDir: cfg.DownloadDir, cancel: cancel, done: done}
+	t.Cleanup(h.stop)
 
-	return &harness{tg: tg, dl: dl, pub: pub, lister: lister, svc: svc, downloadDir: cfg.DownloadDir}
+	return h
+}
+
+// stop cancels the service context and waits for Run to return. It is safe
+// to call more than once.
+func (h *harness) stop() {
+	h.stopMu.Lock()
+	defer h.stopMu.Unlock()
+	if h.stopped {
+		return
+	}
+	h.stopped = true
+	h.cancel()
+	select {
+	case <-h.done:
+	case <-time.After(5 * time.Second):
+		// The test that owns this harness reports the failure.
+	}
 }
 
 func driveFileResult(id string) drive.Result {
