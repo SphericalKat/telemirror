@@ -18,6 +18,7 @@ type harness struct {
 	tg          *fakeTelegram
 	dl          *fakeDownloader
 	pub         *fakePublisher
+	disk        *fakeDiskUsage
 	lister      *fakeLister
 	svc         *mirror.Service
 	downloadDir string
@@ -37,8 +38,12 @@ func newHarness(t *testing.T, mutate func(*mirror.Config)) *harness {
 		DownloadDir:          t.TempDir(),
 		StatusUpdateInterval: 10 * time.Millisecond,
 	}
+	diskUsage := newFakeDiskUsage()
 	if mutate != nil {
 		mutate(&cfg)
+	}
+	if cfg.DiskUsage == nil {
+		cfg.DiskUsage = diskUsage.Usage
 	}
 
 	tg := &fakeTelegram{}
@@ -55,7 +60,7 @@ func newHarness(t *testing.T, mutate func(*mirror.Config)) *harness {
 	done := make(chan error, 1)
 	go func() { done <- svc.Run(ctx) }()
 
-	h := &harness{tg: tg, dl: dl, pub: pub, lister: lister, svc: svc, downloadDir: cfg.DownloadDir, cancel: cancel, done: done}
+	h := &harness{tg: tg, dl: dl, pub: pub, disk: diskUsage, lister: lister, svc: svc, downloadDir: cfg.DownloadDir, cancel: cancel, done: done}
 	t.Cleanup(h.stop)
 
 	return h

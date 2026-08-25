@@ -1,0 +1,60 @@
+# Linux systemd service for the Telemirror mirror bot.
+#
+# Telemirror runs as one process. It needs no separate download service.
+#
+# Install the service:
+#   1. Create a service user:
+#      sudo useradd --system --home-dir /var/lib/telemirror --shell /usr/sbin/nologin telemirror
+#   2. Install the binary and this file:
+#      sudo install -m 755 telemirror /usr/local/bin/telemirror
+#      sudo install -m 644 contrib/telemirror.service /etc/systemd/system/telemirror.service
+#   3. Put the Google OAuth client secret in the working directory:
+#      /var/lib/telemirror/client_secret.json
+#   4. Authorize Drive once with a terminal. Run this as the service user
+#      in the working directory, follow the printed URL, and enter the
+#      authorization code. The bot saves the token in token.json:
+#      sudo -u telemirror sh -c 'cd /var/lib/telemirror && /usr/local/bin/telemirror'
+#   5. Start the service:
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now telemirror
+#
+# Telemirror reads its settings from the environment, from
+# /etc/telemirror/config.toml, and from telemirror.toml in the working
+# directory, in that order. Add environment settings with a drop-in file,
+# for example /etc/systemd/system/telemirror.service.d/settings.conf:
+#   [Service]
+#   Environment=TELEGRAM_TOKEN=123456:ABC
+#
+# The downloads go to download_dir from the configuration. The default
+# value "downloads" places them in /var/lib/telemirror/downloads.
+
+[Unit]
+Description=Telemirror Telegram mirror bot
+Documentation=https://github.com/SphericalKat/telemirror
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=telemirror
+Group=telemirror
+StateDirectory=telemirror
+WorkingDirectory=/var/lib/telemirror
+ExecStart=/usr/local/bin/telemirror
+
+# Telemirror stops cleanly on SIGTERM. The timeout gives active work time
+# to finish before systemd sends SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=5s
+
+# The bot writes only below its state directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/telemirror
+
+[Install]
+WantedBy=multi-user.target

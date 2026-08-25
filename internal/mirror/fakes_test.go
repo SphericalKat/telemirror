@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/SphericalKat/telemirror/internal/disk"
 	"github.com/SphericalKat/telemirror/internal/drive"
 	"github.com/SphericalKat/telemirror/internal/engine"
 	"github.com/SphericalKat/telemirror/internal/telegram"
@@ -136,12 +137,11 @@ type fakeDownloader struct {
 	mu         sync.Mutex
 	adds       []fakeAdd
 	addErr     error
-	cancels    []string
 	cancelErr  error
+	cancels    []string
 	gidSeq     int
 	infos      map[string]engine.DownloadInfo
 	statusErrs map[string]error
-	cancelled  []string
 	events     chan engine.Event
 }
 
@@ -189,28 +189,31 @@ func (f *fakeDownloader) add(kind, rawURL string, opts *engine.AddOptions) (stri
 	return gid, nil
 }
 
-// Cancel simulates engine removal: a known download keeps a removed status
-// and emits a stop event, an unknown GID reports ErrNotFound.
+// Cancel removes a download, following the engine contract: an active
+// download is halted, keeps the removed status, and reports a stop event;
+// a queued download disappears without an event; an unknown GID reports
+// engine.ErrNotFound.
 func (f *fakeDownloader) Cancel(gid string) error {
 	f.mu.Lock()
-	if _, ok := f.infos[gid]; !ok {
+	if f.cancelErr != nil {
+		err := f.cancelErr
+		f.mu.Unlock()
+		return err
+	}
+	info, ok := f.infos[gid]
+	if !ok {
 		f.mu.Unlock()
 		return engine.ErrNotFound
 	}
-	info := f.infos[gid]
+	f.cancels = append(f.cancels, gid)
+	wasActive := info.Status == engine.StatusActive
 	info.Status = engine.StatusRemoved
 	f.infos[gid] = info
-	f.cancelled = append(f.cancelled, gid)
 	f.mu.Unlock()
-
-	f.events <- engine.Event{GID: gid, Type: engine.EventStop}
+	if wasActive {
+		f.emit(engine.Event{GID: gid, Type: engine.EventStop})
+	}
 	return nil
-}
-
-func (f *fakeDownloader) cancelledGIDs() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.cancelled...)
 }
 
 func (f *fakeDownloader) Status(gid string) (engine.DownloadInfo, error) {
@@ -224,29 +227,6 @@ func (f *fakeDownloader) Status(gid string) (engine.DownloadInfo, error) {
 		return engine.DownloadInfo{}, fmt.Errorf("unknown GID %s", gid)
 	}
 	return info, nil
-}
-
-// Cancel removes a download, following the engine contract: an active
-// download reports a stop event, a queued download reports nothing.
-func (f *fakeDownloader) Cancel(gid string) error {
-	f.mu.Lock()
-	if f.cancelErr != nil {
-		err := f.cancelErr
-		f.mu.Unlock()
-		return err
-	}
-	f.cancels = append(f.cancels, gid)
-	info, ok := f.infos[gid]
-	wasActive := ok && info.Status == engine.StatusActive
-	if ok {
-		info.Status = engine.StatusRemoved
-		f.infos[gid] = info
-	}
-	f.mu.Unlock()
-	if wasActive {
-		f.emit(engine.Event{GID: gid, Type: engine.EventStop})
-	}
-	return nil
 }
 
 func (f *fakeDownloader) Events() (<-chan engine.Event, func()) {
@@ -279,6 +259,11 @@ func (f *fakeDownloader) cancelled() []string {
 	return append([]string(nil), f.cancels...)
 }
 
+// cancelledGIDs returns the GIDs the service cancelled.
+func (f *fakeDownloader) cancelledGIDs() []string {
+	return f.cancelled()
+}
+
 func (f *fakeDownloader) setStatus(gid string, info engine.DownloadInfo) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -288,6 +273,44 @@ func (f *fakeDownloader) setStatus(gid string, info engine.DownloadInfo) {
 
 func (f *fakeDownloader) emit(ev engine.Event) {
 	f.events <- ev
+}
+
+// fakeDiskUsage replaces the disk reporter. It records every requested
+// path and answers with one scripted result.
+type fakeDiskUsage struct {
+	mu    sync.Mutex
+	calls []string
+	space disk.Space
+	err   error
+}
+
+func newFakeDiskUsage() *fakeDiskUsage {
+	return &fakeDiskUsage{space: disk.Space{
+		TotalBytes: 500 * 1024 * 1024 * 1024,
+		UsedBytes:  120 * 1024 * 1024 * 1024,
+		FreeBytes:  380 * 1024 * 1024 * 1024,
+	}}
+}
+
+func (f *fakeDiskUsage) Usage(path string) (disk.Space, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, path)
+	return f.space, f.err
+}
+
+// requested returns the paths whose space was requested.
+func (f *fakeDiskUsage) requested() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// setErr makes later Usage calls fail with err.
+func (f *fakeDiskUsage) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
 }
 
 // fakeLister replaces the Drive lister. Tests script results and errors and

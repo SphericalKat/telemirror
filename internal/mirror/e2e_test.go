@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SphericalKat/telemirror/internal/disk"
 	"github.com/SphericalKat/telemirror/internal/drive"
 	"github.com/SphericalKat/telemirror/internal/engine"
 	"github.com/SphericalKat/telemirror/internal/mirror"
@@ -43,6 +44,10 @@ func (s *recordingDriveService) GrantReadAccess(_ context.Context, _, _ string) 
 	return nil
 }
 
+func (s *recordingDriveService) ListChildren(_ context.Context, _ string, _ []string) ([]drive.Child, error) {
+	return nil, nil
+}
+
 func (s *recordingDriveService) uploaded() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -71,14 +76,15 @@ func TestServiceWithRealEngineAndPublisher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("drive.NewPublisher() error = %v", err)
 	}
-	lister := newFakeLister()
 
 	tg := &fakeTelegram{}
+	lister := newFakeLister()
 	cfg := mirror.Config{
 		SudoUsers:            []int64{42},
 		AuthorizedChats:      []int64{-100200},
 		DownloadDir:          downloadDir,
 		StatusUpdateInterval: 10 * time.Millisecond,
+		DiskUsage:            disk.Usage,
 	}
 	svc, err := mirror.New(cfg, tg, eng, pub, lister)
 	if err != nil {
@@ -176,14 +182,14 @@ func TestRestartRecoversActiveRequestThroughEngine(t *testing.T) {
 		if err != nil {
 			t.Fatalf("drive.NewPublisher() error = %v", err)
 		}
-		lister := newFakeLister()
 		svc, err := mirror.New(mirror.Config{
 			SudoUsers:            []int64{42},
 			AuthorizedChats:      []int64{-100200},
 			DownloadDir:          downloadDir,
 			StatusUpdateInterval: 10 * time.Millisecond,
+			DiskUsage:            disk.Usage,
 			Store:                store,
-		}, tg, eng, pub, lister)
+		}, tg, eng, pub, newFakeLister())
 		if err != nil {
 			t.Fatalf("mirror.New() error = %v", err)
 		}

@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/SphericalKat/telemirror/internal/config"
 )
 
 func TestOpenStoreDisabledWithoutPath(t *testing.T) {
@@ -37,5 +39,15 @@ func TestOpenStoreOpensUsableDatabase(t *testing.T) {
 	defer store.Close()
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("database file was not created: %v", err)
+	}
+}
+
+func TestMirrorConfigWiresTheDiskReporter(t *testing.T) {
+	out := mirrorConfig(config.Config{DownloadRoot: "/srv/mirror"}, nil)
+	if out.DiskRoot != "/srv/mirror" {
+		t.Errorf("DiskRoot = %q, want /srv/mirror", out.DiskRoot)
+	}
+	if out.DiskUsage == nil {
+		t.Error("DiskUsage = nil, want the platform disk reporter")
 	}
 }

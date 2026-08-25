@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/SphericalKat/telemirror/internal/config"
+	"github.com/SphericalKat/telemirror/internal/disk"
 	"github.com/SphericalKat/telemirror/internal/drive"
 	"github.com/SphericalKat/telemirror/internal/engine"
 	"github.com/SphericalKat/telemirror/internal/mirror"
@@ -55,12 +56,14 @@ func mirrorConfig(cfg config.Config, store *storage.Store) mirror.Config {
 		SudoUsers:            cfg.SudoUsers,
 		AuthorizedChats:      cfg.AuthorizedChats,
 		DownloadDir:          cfg.DownloadDir,
+		DiskRoot:             cfg.DownloadRoot,
 		FilteredDomains:      cfg.FilteredDomains,
 		FilteredFilenames:    cfg.FilteredFilenames,
 		StatusUpdateInterval: time.Duration(cfg.StatusUpdateIntervalMS) * time.Millisecond,
 		CommandsUseBotName:   cfg.CommandsUseBotName,
 		CommandBotName:       cfg.CommandBotName,
 		IsTeamDrive:          cfg.IsTeamDrive,
+		DiskUsage:            disk.Usage,
 	}
 	if store != nil {
 		out.Store = store
@@ -76,10 +79,6 @@ func main() {
 
 func run() error {
 	cfg, err := config.Load(config.DefaultSystemPath, config.DefaultLocalPath)
-	if err != nil {
-		return err
-	}
-	lister, err := drive.NewLister(driveService, drive.Config{ParentFolderID: cfg.GDriveParentDirID})
 	if err != nil {
 		return err
 	}
@@ -118,6 +117,10 @@ func run() error {
 		},
 		SharedDrive: cfg.IsTeamDrive,
 	})
+	if err != nil {
+		return err
+	}
+	lister, err := drive.NewLister(driveService, drive.Config{ParentFolderID: cfg.GDriveParentDirID})
 	if err != nil {
 		return err
 	}

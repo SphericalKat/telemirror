@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/SphericalKat/telemirror/internal/disk"
 	"github.com/SphericalKat/telemirror/internal/drive"
 	"github.com/SphericalKat/telemirror/internal/engine"
 	"github.com/SphericalKat/telemirror/internal/storage"
@@ -63,13 +64,6 @@ type Publisher interface {
 	Publish(ctx context.Context, root string, onProgress func(drive.Progress)) (drive.Result, error)
 }
 
-// Lister browses the configured Drive destination. The Drive lister
-// implements it.
-type Lister interface {
-	List(ctx context.Context, fileName string) ([]drive.Child, error)
-	FolderLink() string
-}
-
 // Store persists mirror requests across restarts. The SQLite store in the
 // storage package implements it. A nil Store disables persistence; store
 // errors are logged and never stop mirroring.
@@ -85,6 +79,21 @@ type Store interface {
 	Load() ([]storage.StoredRequest, error)
 }
 
+// DiskUsage reports the total, used, and available space of the file
+// system that holds path. The disk package's Usage function implements it.
+type DiskUsage func(path string) (disk.Space, error)
+
+// Lister browses the configured Drive destination. The Drive lister
+// implements it.
+type Lister interface {
+	// List returns the direct children of the configured Drive folder
+	// whose names contain fileName, newest first, at most 20.
+	List(ctx context.Context, fileName string) ([]drive.Child, error)
+
+	// FolderLink returns the link to the configured Drive folder.
+	FolderLink() string
+}
+
 // Config holds the settings the mirror service needs.
 type Config struct {
 	// SudoUsers lists the Telegram users who can use the bot in any chat.
@@ -95,6 +104,10 @@ type Config struct {
 
 	// DownloadDir is the base directory that holds one directory per request.
 	DownloadDir string
+
+	// DiskRoot is the mount point whose space /disk reports. An empty
+	// value reports the file system of the download directory.
+	DiskRoot string
 
 	// FilteredDomains lists the blocked domain substrings.
 	FilteredDomains []string
@@ -128,6 +141,10 @@ type Config struct {
 	// lifetime of 10 seconds.
 	TemporaryReplyDeleteDelay time.Duration
 
+	// DiskUsage reports the disk space that /disk sends. The disk
+	// package's Usage function implements it.
+	DiskUsage DiskUsage
+
 	// Store persists queued and active mirror requests so they resume
 	// after a restart. Nil disables persistence.
 	Store Store
@@ -135,8 +152,9 @@ type Config struct {
 
 // Message lifetimes follow the upstream bot: temporary replies disappear
 // after ten seconds, a status message created by /mirrorStatus disappears
-// after sixty seconds, and the final status messages disappear ten seconds
-// after the last tracked download finishes.
+// after sixty seconds, the final status messages disappear ten seconds
+// after the last tracked download finishes, and /list results and
+// /getFolder links disappear after sixty seconds.
 const (
 	temporaryReplyDeleteDelay = 10 * time.Second
 	statusDeleteDelay         = 10 * time.Second
@@ -330,6 +348,8 @@ func New(cfg Config, tg telegram.Client, dl Downloader, pub Publisher, lister Li
 		return nil, errors.New("mirror service requires a positive status update interval")
 	case cfg.CommandsUseBotName && strings.TrimSpace(cfg.CommandBotName) == "":
 		return nil, errors.New("mirror service requires a bot name when commands must use it")
+	case cfg.DiskUsage == nil:
+		return nil, errors.New("mirror service requires a disk usage reporter")
 	}
 	return &Service{
 		cfg:      cfg,
@@ -383,6 +403,8 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 
 	// Group chats may require the configured bot username after a command.
 	// Command matching is case-insensitive, like the upstream bot.
+	// /list stays available without the username, so every bot in a group
+	// can answer file searches.
 	if s.cfg.CommandsUseBotName && msg.Chat.Type != "private" &&
 		command != "list" && !strings.EqualFold(suffix, s.requiredBotName()) {
 		return
@@ -405,6 +427,16 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 			return
 		}
 		s.sendPermanentReply(ctx, msg, "You should know the commands already. Happy mirroring.")
+	case "disk":
+		// The upstream command set accepts no argument for these commands.
+		if arg != "" {
+			return
+		}
+		if !s.isAuthorized(msg) {
+			s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
+			return
+		}
+		s.handleDisk(ctx, msg)
 	case "mirrorstatus":
 		if arg != "" {
 			return
@@ -490,6 +522,30 @@ func (s *Service) handleMirror(ctx context.Context, msg *telegram.Message, url s
 
 	log.Printf("mirror: gid %s download %s", gid, url)
 	s.sendStatusMessage(context.WithoutCancel(ctx), rec)
+}
+
+// handleDisk answers /disk: it reports the total, used, and available
+// space of the configured disk root. The values come from a Go system
+// call through the disk reporter, so the command builds no shell command
+// from configuration input.
+func (s *Service) handleDisk(ctx context.Context, msg *telegram.Message) {
+	space, err := s.cfg.DiskUsage(s.diskRoot())
+	if err != nil {
+		log.Printf("mirror: disk usage: %v", err)
+		s.sendTemporaryReply(ctx, msg, fmt.Sprintf("Failed to get disk space. %v", err))
+		return
+	}
+	s.sendTemporaryReply(ctx, msg, fmt.Sprintf("Total space: %s\nUsed: %s\nAvailable: %s",
+		formatSize(space.TotalBytes), formatSize(space.UsedBytes), formatSize(space.FreeBytes)))
+}
+
+// diskRoot returns the mount point whose space /disk reports. An empty
+// configured root reports the file system that holds the downloads.
+func (s *Service) diskRoot() string {
+	if s.cfg.DiskRoot != "" {
+		return s.cfg.DiskRoot
+	}
+	return s.cfg.DownloadDir
 }
 
 // handleMirrorStatus answers /mirrorStatus: it replaces the chat's status
@@ -1111,17 +1167,20 @@ func isMagnetURI(input string) bool {
 }
 
 // sendTemporaryReply replies to a command message and removes both messages
-// after the temporary reply lifetime.
+// after the temporary reply lifetime, which the configuration can shorten.
 func (s *Service) sendTemporaryReply(ctx context.Context, msg *telegram.Message, text string) {
 	s.replyWithLifetime(ctx, msg, text, s.replyDeleteDelay())
 }
 
-// sendListReply replies to a command message and keeps the result visible for
-// the longer upstream lifetime used by Drive browsing commands.
+// sendListReply replies to a command message and removes both messages after
+// the longer lifetime the upstream bot gives /list results and /getFolder
+// links.
 func (s *Service) sendListReply(ctx context.Context, msg *telegram.Message, text string) {
 	s.replyWithLifetime(ctx, msg, text, listReplyDeleteDelay)
 }
 
+// replyWithLifetime sends a reply to the command message and removes both
+// messages after delay.
 func (s *Service) replyWithLifetime(ctx context.Context, msg *telegram.Message, text string, delay time.Duration) {
 	sent, err := s.tg.SendMessage(ctx, msg.Chat.ID, text, msg.MessageID)
 	if err != nil {
