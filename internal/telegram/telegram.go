@@ -28,6 +28,10 @@ type Chat struct {
 
 	// Type names the chat type.
 	Type string `json:"type"`
+
+	// AllMembersAreAdministrators reports a basic group where every member
+	// holds administrator rights. Telegram fills it for "group" chats only.
+	AllMembersAreAdministrators bool `json:"all_members_are_administrators"`
 }
 
 // Message is a Telegram message the bot can act on.
@@ -70,4 +74,7 @@ type Client interface {
 
 	// DeleteMessage removes one message.
 	DeleteMessage(ctx context.Context, chatID int64, messageID int64) error
+
+	// ChatAdministrators returns the users who administer chatID.
+	ChatAdministrators(ctx context.Context, chatID int64) ([]User, error)
 }

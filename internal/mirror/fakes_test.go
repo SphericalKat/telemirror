@@ -12,18 +12,21 @@ import (
 
 // fakeTelegram records Telegram operations instead of calling Telegram.
 type fakeTelegram struct {
-	mu      sync.Mutex
-	nextID  int64
-	sent    []sentMessage
-	edited  []editedMessage
-	deleted []deletedMessage
-	sendErr error
+	mu         sync.Mutex
+	nextID     int64
+	sent       []sentMessage
+	edited     []editedMessage
+	deleted    []deletedMessage
+	sendErr    error
+	admins     map[int64][]int64
+	adminCalls []int64
 }
 
 type sentMessage struct {
-	ChatID  int64
-	Text    string
-	ReplyTo int64
+	ChatID    int64
+	MessageID int64
+	Text      string
+	ReplyTo   int64
 }
 
 type editedMessage struct {
@@ -44,7 +47,7 @@ func (f *fakeTelegram) SendMessage(_ context.Context, chatID int64, text string,
 		return telegram.Message{}, f.sendErr
 	}
 	f.nextID++
-	f.sent = append(f.sent, sentMessage{ChatID: chatID, Text: text, ReplyTo: replyTo})
+	f.sent = append(f.sent, sentMessage{ChatID: chatID, MessageID: f.nextID, Text: text, ReplyTo: replyTo})
 	return telegram.Message{MessageID: f.nextID, Chat: telegram.Chat{ID: chatID}}, nil
 }
 
@@ -60,6 +63,35 @@ func (f *fakeTelegram) DeleteMessage(_ context.Context, chatID, messageID int64)
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, deletedMessage{ChatID: chatID, MessageID: messageID})
 	return nil
+}
+
+// ChatAdministrators answers with the configured administrators of a chat.
+func (f *fakeTelegram) ChatAdministrators(_ context.Context, chatID int64) ([]telegram.User, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adminCalls = append(f.adminCalls, chatID)
+	users := make([]telegram.User, 0, len(f.admins[chatID]))
+	for _, id := range f.admins[chatID] {
+		users = append(users, telegram.User{ID: id})
+	}
+	return users, nil
+}
+
+// setAdmins configures the administrators of one chat.
+func (f *fakeTelegram) setAdmins(chatID int64, userIDs ...int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.admins == nil {
+		f.admins = map[int64][]int64{}
+	}
+	f.admins[chatID] = userIDs
+}
+
+// administratorCalls returns the chats whose administrators were requested.
+func (f *fakeTelegram) administratorCalls() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.adminCalls...)
 }
 
 func (f *fakeTelegram) sends() []sentMessage {
@@ -104,6 +136,8 @@ type fakeDownloader struct {
 	mu         sync.Mutex
 	adds       []fakeAdd
 	addErr     error
+	cancels    []string
+	cancelErr  error
 	gidSeq     int
 	infos      map[string]engine.DownloadInfo
 	statusErrs map[string]error
@@ -157,6 +191,29 @@ func (f *fakeDownloader) Status(gid string) (engine.DownloadInfo, error) {
 	return info, nil
 }
 
+// Cancel removes a download, following the engine contract: an active
+// download reports a stop event, a queued download reports nothing.
+func (f *fakeDownloader) Cancel(gid string) error {
+	f.mu.Lock()
+	if f.cancelErr != nil {
+		err := f.cancelErr
+		f.mu.Unlock()
+		return err
+	}
+	f.cancels = append(f.cancels, gid)
+	info, ok := f.infos[gid]
+	wasActive := ok && info.Status == engine.StatusActive
+	if ok {
+		info.Status = engine.StatusRemoved
+		f.infos[gid] = info
+	}
+	f.mu.Unlock()
+	if wasActive {
+		f.emit(engine.Event{GID: gid, Type: engine.EventStop})
+	}
+	return nil
+}
+
 func (f *fakeDownloader) Events() (<-chan engine.Event, func()) {
 	return f.events, func() {
 		defer func() {
@@ -178,6 +235,13 @@ func (f *fakeDownloader) setAddErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.addErr = err
+}
+
+// cancelled returns the GIDs the service cancelled.
+func (f *fakeDownloader) cancelled() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cancels...)
 }
 
 func (f *fakeDownloader) setStatus(gid string, info engine.DownloadInfo) {

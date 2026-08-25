@@ -175,6 +175,34 @@ func TestAPIErrorIsReported(t *testing.T) {
 	}
 }
 
+func TestChatAdministratorsSendsChatIDAndParsesUsers(t *testing.T) {
+	fake := newFakeBotAPI()
+	fake.responses["getChatAdministrators"] = `{
+		"ok": true,
+		"result": [
+			{"status": "administrator", "user": {"id": 42, "is_bot": false, "first_name": "Kat"}},
+			{"status": "creator", "user": {"id": 9001, "is_bot": false, "first_name": "Amogh"}}
+		]
+	}`
+	api := newTestAPI(t, fake)
+
+	admins, err := api.ChatAdministrators(context.Background(), -100200)
+	if err != nil {
+		t.Fatalf("ChatAdministrators() error = %v", err)
+	}
+
+	calls := fake.recorded()
+	if len(calls) != 1 || calls[0].method != "getChatAdministrators" {
+		t.Fatalf("calls = %+v, want one getChatAdministrators", calls)
+	}
+	if calls[0].body["chat_id"].(float64) != -100200 {
+		t.Errorf("chat_id = %v, want -100200", calls[0].body["chat_id"])
+	}
+	if len(admins) != 2 || admins[0].ID != 42 || admins[1].ID != 9001 {
+		t.Errorf("admins = %+v, want the users of both chat members", admins)
+	}
+}
+
 func TestPollDeliversUpdatesAndAdvancesOffset(t *testing.T) {
 	fake := newFakeBotAPI()
 	updateJSON := `{"ok": true, "result": [

@@ -130,6 +130,24 @@ func (a *API) DeleteMessage(ctx context.Context, chatID, messageID int64) error 
 	return a.call(ctx, "deleteMessage", payload, nil)
 }
 
+// ChatAdministrators returns the administrators of one chat.
+func (a *API) ChatAdministrators(ctx context.Context, chatID int64) ([]User, error) {
+	payload := map[string]any{
+		"chat_id": chatID,
+	}
+	var members []struct {
+		User User `json:"user"`
+	}
+	if err := a.call(ctx, "getChatAdministrators", payload, &members); err != nil {
+		return nil, err
+	}
+	users := make([]User, 0, len(members))
+	for _, member := range members {
+		users = append(users, member.User)
+	}
+	return users, nil
+}
+
 // Poll long-polls for updates and hands each one to handler. Poll blocks
 // until ctx is cancelled and then returns nil. Failed getUpdates calls are
 // logged and retried after a pause.

@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +32,11 @@ import (
 type Downloader interface {
 	// AddURL queues an HTTP or HTTPS download in opts.Dir and returns its GID.
 	AddURL(rawURL string, opts *engine.AddOptions) (string, error)
+
+	// Cancel removes a queued or active download. A queued download
+	// disappears without a stop event; an active download is stopped and
+	// reports one.
+	Cancel(gid string) error
 
 	// Status returns the current snapshot of one download.
 	Status(gid string) (engine.DownloadInfo, error)
@@ -72,14 +78,39 @@ type Config struct {
 	// IsTeamDrive publishes results to a Shared Drive and adds the upstream
 	// folder-link limitation notice to folder results.
 	IsTeamDrive bool
+
+	// StatusMessageTTL is how long a status message created by
+	// /mirrorStatus lives before the bot removes it. Zero means the
+	// upstream lifetime of 60 seconds.
+	StatusMessageTTL time.Duration
+
+	// TemporaryReplyDeleteDelay is how long a temporary reply and its
+	// command live before the bot removes them. Zero means the upstream
+	// lifetime of 10 seconds.
+	TemporaryReplyDeleteDelay time.Duration
 }
 
 // Message lifetimes follow the upstream bot: temporary replies disappear
-// after ten seconds, and status messages disappear ten seconds after the
-// last tracked download finishes.
+// after ten seconds, a status message created by /mirrorStatus disappears
+// after sixty seconds, and the final status messages disappear ten seconds
+// after the last tracked download finishes.
 const (
 	temporaryReplyDeleteDelay = 10 * time.Second
 	statusDeleteDelay         = 10 * time.Second
+	defaultStatusMessageTTL   = 60 * time.Second
+)
+
+// unauthorizedMessage is the upstream response for commands from senders
+// who may not use the bot.
+const unauthorizedMessage = "You aren't authorized to use this bot here."
+
+// Upstream access codes, ordered from strongest to weakest control.
+const (
+	authSudo       = 0 // A configured sudo user.
+	authOwner      = 1 // The download owner replying to the request.
+	authChatAdmins = 2 // A member of an authorized chat where all members administrate.
+	authChatMember = 3 // A member of an authorized chat with an unknown role.
+	authDenied     = -1
 )
 
 // Service is the central mirror service.
@@ -111,11 +142,14 @@ type record struct {
 	chatID          int64
 	messageID       int64
 	userID          int64
+	username        string
 	repliedUsername string
 	started         time.Time
 
 	mu              sync.Mutex
+	downloadStarted bool
 	uploading       bool
+	cancelNotified  bool
 	uploadedBytes   int64
 	lastUploadBytes int64
 	lastUploadCheck time.Time
@@ -135,6 +169,44 @@ func (r *record) setUploading(uploading bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.uploading = uploading
+}
+
+// markStarted records that the engine started the download.
+func (r *record) markStarted() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.downloadStarted = true
+}
+
+// hasStarted reports whether the engine ever started the download.
+// A download that was still queued reports no stop event when cancelled.
+func (r *record) hasStarted() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.downloadStarted
+}
+
+// isUploading reports whether the result is being published now.
+func (r *record) isUploading() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.uploading
+}
+
+// markCancelNotified records that the chat was notified about a manual
+// cancellation, so the final reply for the request is suppressed.
+func (r *record) markCancelNotified() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cancelNotified = true
+}
+
+// cancelNotifiedChat reports whether the chat was notified about a manual
+// cancellation of this request.
+func (r *record) cancelNotifiedChat() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cancelNotified
 }
 
 // setUploadedBytes records upload progress.
@@ -242,10 +314,39 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 	switch command {
 	case "mirror":
 		if !s.isAuthorized(msg) {
-			s.sendTemporaryReply(ctx, msg, "You aren't authorized to use this bot here.")
+			s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
 			return
 		}
 		s.handleMirror(ctx, msg, arg)
+	case "start":
+		// The upstream command set accepts no argument for these commands.
+		if arg != "" {
+			return
+		}
+		if !s.isAuthorized(msg) {
+			s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
+			return
+		}
+		s.sendPermanentReply(ctx, msg, "You should know the commands already. Happy mirroring.")
+	case "mirrorstatus":
+		if arg != "" {
+			return
+		}
+		if !s.isAuthorized(msg) {
+			s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
+			return
+		}
+		s.handleMirrorStatus(ctx, msg)
+	case "cancelmirror":
+		if arg != "" {
+			return
+		}
+		s.handleCancelMirror(ctx, msg)
+	case "cancelall":
+		if arg != "" {
+			return
+		}
+		s.handleCancelAll(ctx, msg)
 	default:
 		// Other commands are handled by later feature work.
 	}
@@ -268,6 +369,7 @@ func (s *Service) handleMirror(ctx context.Context, msg *telegram.Message, url s
 		chatID:          msg.Chat.ID,
 		messageID:       msg.MessageID,
 		userID:          msg.From.ID,
+		username:        renderedUsername(msg),
 		repliedUsername: renderedUsername(msg.ReplyToMessage),
 		started:         time.Now(),
 	}
@@ -291,6 +393,174 @@ func (s *Service) handleMirror(ctx context.Context, msg *telegram.Message, url s
 	s.sendStatusMessage(context.WithoutCancel(ctx), rec)
 }
 
+// handleMirrorStatus answers /mirrorStatus: it replaces the chat's status
+// message with a fresh one, removes the command at once, and removes the
+// status message after its lifetime, like the upstream bot.
+func (s *Service) handleMirrorStatus(ctx context.Context, msg *telegram.Message) {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+
+	if old, ok := s.statuses[msg.Chat.ID]; ok {
+		delete(s.statuses, msg.Chat.ID)
+		if err := s.tg.DeleteMessage(ctx, msg.Chat.ID, old.messageID); err != nil {
+			log.Printf("mirror: delete old status message: %v", err)
+		}
+	}
+
+	text := s.statusText()
+	sent, err := s.tg.SendMessage(ctx, msg.Chat.ID, text, msg.MessageID)
+	if err != nil {
+		log.Printf("mirror: send status message: %v", err)
+		return
+	}
+	s.recMu.Lock()
+	s.statuses[msg.Chat.ID] = &statusMessage{chatID: msg.Chat.ID, messageID: sent.MessageID, lastText: text}
+	s.recMu.Unlock()
+
+	if err := s.tg.DeleteMessage(ctx, msg.Chat.ID, msg.MessageID); err != nil {
+		log.Printf("mirror: delete status command: %v", err)
+	}
+
+	chatID, messageID := msg.Chat.ID, sent.MessageID
+	time.AfterFunc(s.statusTTL(), func() {
+		s.expireStatusMessage(chatID, messageID)
+	})
+}
+
+// expireStatusMessage removes one status message whose lifetime ended. It
+// does nothing when the chat already holds a newer status message.
+func (s *Service) expireStatusMessage(chatID, messageID int64) {
+	s.statusMu.Lock()
+	defer s.statusMu.Unlock()
+
+	s.recMu.Lock()
+	current, ok := s.statuses[chatID]
+	if ok && current.messageID == messageID {
+		delete(s.statuses, chatID)
+	}
+	s.recMu.Unlock()
+	if !ok || current.messageID != messageID {
+		return
+	}
+	if err := s.tg.DeleteMessage(context.Background(), chatID, messageID); err != nil {
+		log.Printf("mirror: delete status message: %v", err)
+	}
+}
+
+// handleCancelMirror answers /cancelMirror. The sender must reply to the
+// original command message of the mirror request being cancelled.
+func (s *Service) handleCancelMirror(ctx context.Context, msg *telegram.Message) {
+	if msg.ReplyToMessage == nil {
+		s.sendTemporaryReply(ctx, msg, "Reply to the command message for the download that you want to cancel.")
+		return
+	}
+	rec := s.findByMessage(msg.ReplyToMessage)
+	if rec == nil {
+		s.sendTemporaryReply(ctx, msg, "Reply to the command message for the download that you want to cancel."+
+			" Also make sure that the download is even active.")
+		return
+	}
+
+	switch code := s.authorization(msg, false); {
+	case code > authDenied && code < authChatMember:
+		s.cancelDownload(ctx, msg, rec)
+	case code == authChatMember:
+		if s.isAdmin(ctx, msg) {
+			s.cancelDownload(ctx, msg, rec)
+		} else {
+			s.sendTemporaryReply(ctx, msg, "You do not have permission to do that.")
+		}
+	default:
+		s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
+	}
+}
+
+// handleCancelAll answers /cancelAll. A sudo user cancels every mirror
+// request; a chat administrator cancels the requests of that chat only.
+func (s *Service) handleCancelAll(ctx context.Context, msg *telegram.Message) {
+	code := s.authorization(msg, true)
+	if code == authDenied {
+		s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
+		return
+	}
+	if code == authChatMember && !s.isAdmin(ctx, msg) {
+		s.sendTemporaryReply(ctx, msg, "You do not have permission to do that.")
+		return
+	}
+
+	s.recMu.Lock()
+	targets := make([]*record, 0, len(s.records))
+	for _, rec := range s.records {
+		if code == authSudo || rec.chatID == msg.Chat.ID {
+			targets = append(targets, rec)
+		}
+	}
+	s.recMu.Unlock()
+	sort.Slice(targets, func(i, j int) bool { return targets[i].started.Before(targets[j].started) })
+
+	// Mark every target before stopping it, so a stop event that arrives
+	// while the loop runs already sees the suppression, and collect the
+	// distinct owner names of each origin chat for one notice per chat.
+	usernames := map[int64][]string{}
+	for _, rec := range targets {
+		rec.markCancelNotified()
+		if !slices.Contains(usernames[rec.chatID], rec.username) {
+			usernames[rec.chatID] = append(usernames[rec.chatID], rec.username)
+		}
+	}
+
+	count := 0
+	for _, rec := range targets {
+		if s.cancelDownload(ctx, nil, rec) {
+			count++
+		}
+	}
+
+	if count == 0 {
+		s.sendTemporaryReply(ctx, msg, "No downloads to cancel")
+		return
+	}
+	s.sendPermanentReply(ctx, msg, fmt.Sprintf("%d downloads cancelled.", count))
+
+	chats := make([]int64, 0, len(usernames))
+	for chatID := range usernames {
+		chats = append(chats, chatID)
+	}
+	sort.Slice(chats, func(i, j int) bool { return chats[i] < chats[j] })
+	for _, chatID := range chats {
+		message := strings.Join(usernames[chatID], ", ") + ", your downloads have been manually cancelled."
+		if _, err := s.tg.SendMessage(ctx, chatID, message, 0); err != nil {
+			log.Printf("mirror: send cancellation notice: %v", err)
+		}
+	}
+}
+
+// cancelDownload stops one mirror request and reports whether it was
+// cancelled. An uploading request is rejected, like the upstream bot. A
+// nil cancelMsg suppresses the per-command replies, which /cancelAll uses.
+func (s *Service) cancelDownload(ctx context.Context, msg *telegram.Message, rec *record) bool {
+	if rec.isUploading() {
+		if msg != nil {
+			s.sendTemporaryReply(ctx, msg, "Upload in progress. Cannot cancel.")
+		}
+		return false
+	}
+
+	if err := s.dl.Cancel(rec.gid); err != nil {
+		log.Printf("mirror: cancel gid %s: %v", rec.gid, err)
+	}
+	if msg != nil && rec.chatID != msg.Chat.ID {
+		// Notify when the cancellation happened outside the origin chat.
+		s.sendTemporaryReply(ctx, msg, "The download was canceled.")
+	}
+	if !rec.hasStarted() {
+		// The engine reports no stop event for a download that never
+		// started, so finish the request here, like the upstream bot.
+		s.finish(ctx, rec, "Download stopped.")
+	}
+	return true
+}
+
 // handleEvent dispatches one download lifecycle event.
 func (s *Service) handleEvent(ctx context.Context, ev engine.Event) {
 	s.recMu.Lock()
@@ -303,6 +573,7 @@ func (s *Service) handleEvent(ctx context.Context, ev engine.Event) {
 
 	switch ev.Type {
 	case engine.EventStart:
+		rec.markStarted()
 		log.Printf("mirror: gid %s started. Dir %s", ev.GID, rec.dir)
 		s.refreshStatuses()
 	case engine.EventComplete:
@@ -368,11 +639,9 @@ func (s *Service) handleFailure(ctx context.Context, rec *record) {
 
 // finish sends the final reply for a mirror request, removes its record, and
 // deletes the local download directory. It runs at most once per request.
+// A request cancelled through /cancelAll sends no reply, because the origin
+// chat already received the manual-cancellation notice.
 func (s *Service) finish(ctx context.Context, rec *record, message string) {
-	if rec.repliedUsername != "" {
-		message += fmt.Sprintf("\ncc: %s", rec.repliedUsername)
-	}
-
 	s.recMu.Lock()
 	if rec.gid != "" {
 		if _, tracked := s.records[rec.gid]; !tracked {
@@ -384,8 +653,13 @@ func (s *Service) finish(ctx context.Context, rec *record, message string) {
 	remaining := len(s.records)
 	s.recMu.Unlock()
 
-	if _, err := s.tg.SendMessage(context.WithoutCancel(ctx), rec.chatID, message, rec.messageID); err != nil {
-		log.Printf("mirror: send completion reply: %v", err)
+	if !rec.cancelNotifiedChat() {
+		if rec.repliedUsername != "" {
+			message += fmt.Sprintf("\ncc: %s", rec.repliedUsername)
+		}
+		if _, err := s.tg.SendMessage(context.WithoutCancel(ctx), rec.chatID, message, rec.messageID); err != nil {
+			log.Printf("mirror: send completion reply: %v", err)
+		}
 	}
 
 	if err := os.RemoveAll(rec.dir); err != nil {
@@ -404,13 +678,65 @@ func (s *Service) finish(ctx context.Context, rec *record, message string) {
 // isAuthorized reports whether the sender may use normal commands: a sudo
 // user anywhere, or any user in an authorized chat.
 func (s *Service) isAuthorized(msg *telegram.Message) bool {
+	return s.authorization(msg, true) > authDenied
+}
+
+// authorization returns the upstream access code for msg:
+//
+//	authSudo       the sender is a configured sudo user
+//	authOwner      the sender replies to their own mirror request
+//	authChatAdmins the chat is authorized and marks all members as
+//	               administrators
+//	authChatMember the chat is authorized and the sender's role is unknown
+//	authDenied     none of the above
+//
+// skipOwner disables the download-owner rule, which /cancelAll does because
+// an owner may not cancel every request.
+func (s *Service) authorization(msg *telegram.Message, skipOwner bool) int {
 	for _, id := range s.cfg.SudoUsers {
 		if id == msg.From.ID {
-			return true
+			return authSudo
+		}
+	}
+	if !skipOwner && msg.ReplyToMessage != nil {
+		if rec := s.findByMessage(msg.ReplyToMessage); rec != nil && rec.userID == msg.From.ID {
+			return authOwner
 		}
 	}
 	for _, id := range s.cfg.AuthorizedChats {
 		if id == msg.Chat.ID {
+			if msg.Chat.AllMembersAreAdministrators {
+				return authChatAdmins
+			}
+			return authChatMember
+		}
+	}
+	return authDenied
+}
+
+// findByMessage returns the tracked mirror request that was started by the
+// given command message, or nil.
+func (s *Service) findByMessage(msg *telegram.Message) *record {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	for _, rec := range s.records {
+		if rec.chatID == msg.Chat.ID && rec.messageID == msg.MessageID {
+			return rec
+		}
+	}
+	return nil
+}
+
+// isAdmin reports whether the sender administrates the chat of msg. A failed
+// administrator lookup counts as a negative answer, like the upstream bot.
+func (s *Service) isAdmin(ctx context.Context, msg *telegram.Message) bool {
+	admins, err := s.tg.ChatAdministrators(ctx, msg.Chat.ID)
+	if err != nil {
+		log.Printf("mirror: get chat administrators: %v", err)
+		return false
+	}
+	for _, admin := range admins {
+		if admin.ID == msg.From.ID {
 			return true
 		}
 	}
@@ -436,8 +762,34 @@ func (s *Service) sendTemporaryReply(ctx context.Context, msg *telegram.Message,
 		log.Printf("mirror: send reply: %v", err)
 		return
 	}
-	s.scheduleDelete(msg.Chat.ID, sent.MessageID, temporaryReplyDeleteDelay)
-	s.scheduleDelete(msg.Chat.ID, msg.MessageID, temporaryReplyDeleteDelay)
+	delay := s.replyDeleteDelay()
+	s.scheduleDelete(msg.Chat.ID, sent.MessageID, delay)
+	s.scheduleDelete(msg.Chat.ID, msg.MessageID, delay)
+}
+
+// sendPermanentReply replies to a command message and removes nothing, like
+// the upstream replies that stay in the chat.
+func (s *Service) sendPermanentReply(ctx context.Context, msg *telegram.Message, text string) {
+	if _, err := s.tg.SendMessage(ctx, msg.Chat.ID, text, msg.MessageID); err != nil {
+		log.Printf("mirror: send reply: %v", err)
+	}
+}
+
+// statusTTL returns the lifetime of a status message created by
+// /mirrorStatus.
+func (s *Service) statusTTL() time.Duration {
+	if s.cfg.StatusMessageTTL > 0 {
+		return s.cfg.StatusMessageTTL
+	}
+	return defaultStatusMessageTTL
+}
+
+// replyDeleteDelay returns the lifetime of a temporary reply.
+func (s *Service) replyDeleteDelay() time.Duration {
+	if s.cfg.TemporaryReplyDeleteDelay > 0 {
+		return s.cfg.TemporaryReplyDeleteDelay
+	}
+	return temporaryReplyDeleteDelay
 }
 
 // scheduleDelete removes one message after delay.

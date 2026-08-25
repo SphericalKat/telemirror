@@ -70,10 +70,15 @@ func driveFileResult(id string) drive.Result {
 
 // update builds a Telegram update around a message.
 func update(chatID, messageID, userID int64, text string) telegram.Update {
+	return updateAs(chatID, messageID, userID, "kat", text)
+}
+
+// updateAs builds a Telegram update around a message from a named user.
+func updateAs(chatID, messageID, userID int64, username, text string) telegram.Update {
 	return telegram.Update{
 		Message: &telegram.Message{
 			MessageID: messageID,
-			From:      &telegram.User{ID: userID, Username: "kat", FirstName: "Kat"},
+			From:      &telegram.User{ID: userID, Username: username, FirstName: "Kat"},
 			Chat:      telegram.Chat{ID: chatID, Type: "group"},
 			Text:      text,
 		},
@@ -84,8 +89,25 @@ func update(chatID, messageID, userID int64, text string) telegram.Update {
 // message ID, which later replies must target.
 func (h *harness) command(t *testing.T, chatID, userID int64, text string) int64 {
 	t.Helper()
+	return h.commandAs(t, chatID, userID, "kat", text)
+}
+
+// commandAs sends a command message from a named user.
+func (h *harness) commandAs(t *testing.T, chatID, userID int64, username, text string) int64 {
+	t.Helper()
 	msgID := h.tg.newMessageID()
-	h.svc.HandleUpdate(context.Background(), update(chatID, msgID, userID, text))
+	h.svc.HandleUpdate(context.Background(), updateAs(chatID, msgID, userID, username, text))
+	return msgID
+}
+
+// replyCommand sends a command message that replies to target and returns
+// the command message ID.
+func (h *harness) replyCommand(t *testing.T, chatID, userID int64, text string, target telegram.Message) int64 {
+	t.Helper()
+	msgID := h.tg.newMessageID()
+	up := update(chatID, msgID, userID, text)
+	up.Message.ReplyToMessage = &target
+	h.svc.HandleUpdate(context.Background(), up)
 	return msgID
 }
 
