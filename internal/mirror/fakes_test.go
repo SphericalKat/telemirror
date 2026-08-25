@@ -290,6 +290,52 @@ func (f *fakeDownloader) emit(ev engine.Event) {
 	f.events <- ev
 }
 
+// fakeLister replaces the Drive lister. Tests script results and errors and
+// record the searched names.
+type fakeLister struct {
+	mu         sync.Mutex
+	searches   []string
+	results    []drive.Child
+	err        error
+	folderLink string
+}
+
+func newFakeLister() *fakeLister {
+	return &fakeLister{folderLink: "https://drive.example/folder"}
+}
+
+func (f *fakeLister) List(_ context.Context, fileName string) ([]drive.Child, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.searches = append(f.searches, fileName)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.results, nil
+}
+
+func (f *fakeLister) FolderLink() string {
+	return f.folderLink
+}
+
+func (f *fakeLister) searched() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.searches...)
+}
+
+func (f *fakeLister) setResults(children []drive.Child) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.results = children
+}
+
+func (f *fakeLister) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
 // fakePublisher replaces the Drive publisher.
 type fakePublisher struct {
 	mu       sync.Mutex

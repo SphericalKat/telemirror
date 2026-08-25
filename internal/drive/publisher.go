@@ -16,8 +16,8 @@ const folderMIMEType = "application/vnd.google-apps.folder"
 // fallbackMIMEType is used when the file extension has no known MIME type.
 const fallbackMIMEType = "application/octet-stream"
 
-// Service is the Drive boundary used by Publisher. The real implementation
-// talks to Google Drive; tests replace it with a fake.
+// Service is the Drive boundary used by Publisher and Lister. The real
+// implementation talks to Google Drive; tests replace it with a fake.
 type Service interface {
 	// CreateFolder creates a folder under parentID and returns its Drive ID.
 	CreateFolder(ctx context.Context, name, parentID string) (string, error)
@@ -31,6 +31,10 @@ type Service interface {
 
 	// GrantReadAccess lets one email address read fileID.
 	GrantReadAccess(ctx context.Context, fileID, email string) error
+
+	// ListChildren returns the children of parentID whose names contain
+	// any of names, ordered by newest modification first.
+	ListChildren(ctx context.Context, parentID string, names []string) ([]Child, error)
 }
 
 // PrivateSharing configures reader access for specific email addresses.

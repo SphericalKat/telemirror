@@ -41,6 +41,10 @@ func (s *recordingDriveService) GrantReadAccess(_ context.Context, _, _ string) 
 	return nil
 }
 
+func (s *recordingDriveService) ListChildren(_ context.Context, _ string, _ []string) ([]drive.Child, error) {
+	return nil, nil
+}
+
 func (s *recordingDriveService) uploaded() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -71,13 +75,14 @@ func TestServiceWithRealEngineAndPublisher(t *testing.T) {
 	}
 
 	tg := &fakeTelegram{}
+	lister := newFakeLister()
 	cfg := mirror.Config{
 		SudoUsers:            []int64{42},
 		AuthorizedChats:      []int64{-100200},
 		DownloadDir:          downloadDir,
 		StatusUpdateInterval: 10 * time.Millisecond,
 	}
-	svc, err := mirror.New(cfg, tg, eng, pub)
+	svc, err := mirror.New(cfg, tg, eng, pub, lister)
 	if err != nil {
 		t.Fatalf("mirror.New() error = %v", err)
 	}

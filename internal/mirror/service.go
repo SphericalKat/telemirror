@@ -64,6 +64,17 @@ type Publisher interface {
 	Publish(ctx context.Context, root string, onProgress func(drive.Progress)) (drive.Result, error)
 }
 
+// Lister browses the configured Drive destination. The Drive lister
+// implements it.
+type Lister interface {
+	// List returns the direct children of the configured Drive folder
+	// whose names contain fileName, newest first, at most 20.
+	List(ctx context.Context, fileName string) ([]drive.Child, error)
+
+	// FolderLink returns the link to the configured Drive folder.
+	FolderLink() string
+}
+
 // Config holds the settings the mirror service needs.
 type Config struct {
 	// SudoUsers lists the Telegram users who can use the bot in any chat.
@@ -124,19 +135,21 @@ const unauthorizedMessage = "You aren't authorized to use this bot here."
 
 // Upstream access codes, ordered from strongest to weakest control.
 const (
-	authSudo       = 0 // A configured sudo user.
-	authOwner      = 1 // The download owner replying to the request.
-	authChatAdmins = 2 // A member of an authorized chat where all members administrate.
-	authChatMember = 3 // A member of an authorized chat with an unknown role.
-	authDenied     = -1
+	authSudo             = 0 // A configured sudo user.
+	authOwner            = 1 // The download owner replying to the request.
+	authChatAdmins       = 2 // A member of an authorized chat where all members administrate.
+	authChatMember       = 3 // A member of an authorized chat with an unknown role.
+	authDenied           = -1
+	listReplyDeleteDelay = 60 * time.Second
 )
 
 // Service is the central mirror service.
 type Service struct {
-	cfg Config
-	tg  telegram.Client
-	dl  Downloader
-	pub Publisher
+	cfg    Config
+	tg     telegram.Client
+	dl     Downloader
+	pub    Publisher
+	lister Lister
 
 	// recMu guards the records and statuses maps and the record identity.
 	recMu sync.Mutex
@@ -282,7 +295,7 @@ type statusMessage struct {
 
 // New creates a mirror service. Start the service with Run before handling
 // updates, because Run subscribes to the download events.
-func New(cfg Config, tg telegram.Client, dl Downloader, pub Publisher) (*Service, error) {
+func New(cfg Config, tg telegram.Client, dl Downloader, pub Publisher, lister Lister) (*Service, error) {
 	switch {
 	case tg == nil:
 		return nil, errors.New("mirror service requires a Telegram client")
@@ -290,6 +303,8 @@ func New(cfg Config, tg telegram.Client, dl Downloader, pub Publisher) (*Service
 		return nil, errors.New("mirror service requires a downloader")
 	case pub == nil:
 		return nil, errors.New("mirror service requires a publisher")
+	case lister == nil:
+		return nil, errors.New("mirror service requires a Drive lister")
 	case strings.TrimSpace(cfg.DownloadDir) == "":
 		return nil, errors.New("mirror service requires a download directory")
 	case cfg.StatusUpdateInterval <= 0:
@@ -302,6 +317,7 @@ func New(cfg Config, tg telegram.Client, dl Downloader, pub Publisher) (*Service
 		tg:       tg,
 		dl:       dl,
 		pub:      pub,
+		lister:   lister,
 		records:  map[string]*record{},
 		statuses: map[int64]*statusMessage{},
 	}, nil
@@ -344,7 +360,10 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 
 	// Group chats may require the configured bot username after a command.
 	// Command matching is case-insensitive, like the upstream bot.
-	if s.cfg.CommandsUseBotName && msg.Chat.Type != "private" && !strings.EqualFold(suffix, s.requiredBotName()) {
+	// /list stays available without the username, so every bot in a group
+	// can answer file searches.
+	if s.cfg.CommandsUseBotName && msg.Chat.Type != "private" &&
+		command != "list" && !strings.EqualFold(suffix, s.requiredBotName()) {
 		return
 	}
 
@@ -384,6 +403,18 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 			return
 		}
 		s.handleCancelAll(ctx, msg)
+	case "list":
+		if !s.isAuthorized(msg) {
+			s.sendTemporaryReply(ctx, msg, "You aren't authorized to use this bot here.")
+			return
+		}
+		s.handleList(ctx, msg, arg)
+	case "getfolder":
+		if !s.isAuthorized(msg) {
+			s.sendTemporaryReply(ctx, msg, "You aren't authorized to use this bot here.")
+			return
+		}
+		s.handleGetFolder(ctx, msg, arg)
 	default:
 		// Other commands are handled by later feature work.
 	}
@@ -938,12 +969,24 @@ func isMagnetURI(input string) bool {
 // sendTemporaryReply replies to a command message and removes both messages
 // after the temporary reply lifetime.
 func (s *Service) sendTemporaryReply(ctx context.Context, msg *telegram.Message, text string) {
+	s.replyWithLifetime(ctx, msg, text, temporaryReplyDeleteDelay)
+}
+
+// sendListReply replies to a command message and removes both messages after
+// the longer lifetime the upstream bot gives /list results and /getFolder
+// links.
+func (s *Service) sendListReply(ctx context.Context, msg *telegram.Message, text string) {
+	s.replyWithLifetime(ctx, msg, text, listReplyDeleteDelay)
+}
+
+// replyWithLifetime sends a reply to the command message and removes both
+// messages after delay.
+func (s *Service) replyWithLifetime(ctx context.Context, msg *telegram.Message, text string, delay time.Duration) {
 	sent, err := s.tg.SendMessage(ctx, msg.Chat.ID, text, msg.MessageID)
 	if err != nil {
 		log.Printf("mirror: send reply: %v", err)
 		return
 	}
-	delay := s.replyDeleteDelay()
 	s.scheduleDelete(msg.Chat.ID, sent.MessageID, delay)
 	s.scheduleDelete(msg.Chat.ID, msg.MessageID, delay)
 }

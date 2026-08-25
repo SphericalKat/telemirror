@@ -17,6 +17,7 @@ type harness struct {
 	tg          *fakeTelegram
 	dl          *fakeDownloader
 	pub         *fakePublisher
+	lister      *fakeLister
 	svc         *mirror.Service
 	downloadDir string
 }
@@ -37,8 +38,9 @@ func newHarness(t *testing.T, mutate func(*mirror.Config)) *harness {
 	tg := &fakeTelegram{}
 	dl := newFakeDownloader()
 	pub := newFakePublisher(driveFileResult("file-1"))
+	lister := newFakeLister()
 
-	svc, err := mirror.New(cfg, tg, dl, pub)
+	svc, err := mirror.New(cfg, tg, dl, pub, lister)
 	if err != nil {
 		t.Fatalf("mirror.New() error = %v", err)
 	}
@@ -56,7 +58,7 @@ func newHarness(t *testing.T, mutate func(*mirror.Config)) *harness {
 		}
 	})
 
-	return &harness{tg: tg, dl: dl, pub: pub, svc: svc, downloadDir: cfg.DownloadDir}
+	return &harness{tg: tg, dl: dl, pub: pub, lister: lister, svc: svc, downloadDir: cfg.DownloadDir}
 }
 
 func driveFileResult(id string) drive.Result {

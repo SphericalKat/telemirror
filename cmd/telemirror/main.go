@@ -73,6 +73,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	lister, err := drive.NewLister(driveService, drive.Config{ParentFolderID: cfg.GDriveParentDirID})
+	if err != nil {
+		return err
+	}
 
 	eng, err := engine.New(engine.Config{
 		DownloadDir:   cfg.DownloadDir,
@@ -93,7 +97,7 @@ func run() error {
 		CommandsUseBotName:   cfg.CommandsUseBotName,
 		CommandBotName:       cfg.CommandBotName,
 		IsTeamDrive:          cfg.IsTeamDrive,
-	}, api, eng, publisher)
+	}, api, eng, publisher, lister)
 	if err != nil {
 		return err
 	}

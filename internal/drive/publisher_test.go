@@ -30,6 +30,14 @@ type fakeService struct {
 	publicErr     error
 	readerErr     error
 
+	// listResults and listErr script child searches.
+	listResults []drive.Child
+	listErr     error
+
+	// lastList records the most recent child search request.
+	lastListParent string
+	lastListNames  []string
+
 	// blockUploads makes uploads wait for context cancellation.
 	blockUploads bool
 }
@@ -98,6 +106,24 @@ func (f *fakeService) GrantReadAccess(_ context.Context, fileID, email string) e
 	}
 	f.ops = append(f.ops, driveOp{kind: "reader", id: fileID, name: email})
 	return nil
+}
+
+func (f *fakeService) ListChildren(_ context.Context, parentID string, names []string) ([]drive.Child, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	f.lastListParent = parentID
+	f.lastListNames = append([]string(nil), names...)
+	return append([]drive.Child(nil), f.listResults...), nil
+}
+
+// lastSearch returns the recorded search request.
+func (f *fakeService) lastSearch() (parentID string, names []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastListParent, append([]string(nil), f.lastListNames...)
 }
 
 func (f *fakeService) snapshot() []driveOp {
