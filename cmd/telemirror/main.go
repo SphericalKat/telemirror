@@ -88,6 +88,7 @@ func run() error {
 		AuthorizedChats:      cfg.AuthorizedChats,
 		DownloadDir:          cfg.DownloadDir,
 		FilteredDomains:      cfg.FilteredDomains,
+		FilteredFilenames:    cfg.FilteredFilenames,
 		StatusUpdateInterval: time.Duration(cfg.StatusUpdateIntervalMS) * time.Millisecond,
 		CommandsUseBotName:   cfg.CommandsUseBotName,
 		CommandBotName:       cfg.CommandBotName,

@@ -141,12 +141,15 @@ type fakeDownloader struct {
 	gidSeq     int
 	infos      map[string]engine.DownloadInfo
 	statusErrs map[string]error
+	cancelled  []string
 	events     chan engine.Event
 }
 
 type fakeAdd struct {
-	URL string
-	Dir string
+	// Kind is "url" for AddURL calls and "magnet" for AddMagnet calls.
+	Kind string
+	URL  string
+	Dir  string
 }
 
 func newFakeDownloader() *fakeDownloader {
@@ -158,6 +161,14 @@ func newFakeDownloader() *fakeDownloader {
 }
 
 func (f *fakeDownloader) AddURL(rawURL string, opts *engine.AddOptions) (string, error) {
+	return f.add("url", rawURL, opts)
+}
+
+func (f *fakeDownloader) AddMagnet(magnetURI string, opts *engine.AddOptions) (string, error) {
+	return f.add("magnet", magnetURI, opts)
+}
+
+func (f *fakeDownloader) add(kind, rawURL string, opts *engine.AddOptions) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.addErr != nil {
@@ -169,13 +180,37 @@ func (f *fakeDownloader) AddURL(rawURL string, opts *engine.AddOptions) (string,
 	}
 	f.gidSeq++
 	gid := fmt.Sprintf("gid%d", f.gidSeq)
-	f.adds = append(f.adds, fakeAdd{URL: rawURL, Dir: dir})
+	f.adds = append(f.adds, fakeAdd{Kind: kind, URL: rawURL, Dir: dir})
 	f.infos[gid] = engine.DownloadInfo{
 		GID:    gid,
 		Status: engine.StatusWaiting,
 		Dir:    dir,
 	}
 	return gid, nil
+}
+
+// Cancel simulates engine removal: a known download keeps a removed status
+// and emits a stop event, an unknown GID reports ErrNotFound.
+func (f *fakeDownloader) Cancel(gid string) error {
+	f.mu.Lock()
+	if _, ok := f.infos[gid]; !ok {
+		f.mu.Unlock()
+		return engine.ErrNotFound
+	}
+	info := f.infos[gid]
+	info.Status = engine.StatusRemoved
+	f.infos[gid] = info
+	f.cancelled = append(f.cancelled, gid)
+	f.mu.Unlock()
+
+	f.events <- engine.Event{GID: gid, Type: engine.EventStop}
+	return nil
+}
+
+func (f *fakeDownloader) cancelledGIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cancelled...)
 }
 
 func (f *fakeDownloader) Status(gid string) (engine.DownloadInfo, error) {

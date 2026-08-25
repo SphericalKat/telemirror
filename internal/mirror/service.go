@@ -30,16 +30,29 @@ import (
 // Downloader is the download engine boundary the service needs.
 // The embedded engine implements it.
 type Downloader interface {
-	// AddURL queues an HTTP or HTTPS download in opts.Dir and returns its GID.
+	// AddURL queues an HTTP or HTTPS download in opts.Dir and returns its
+	// GID. A URL that names a .torrent file or answers with the BitTorrent
+	// content type first downloads the torrent metadata; the completion
+	// event then carries the GID of the download that holds the real files
+	// in FollowedBy.
 	AddURL(rawURL string, opts *engine.AddOptions) (string, error)
 
 	// Cancel removes a queued or active download. A queued download
 	// disappears without a stop event; an active download is stopped and
 	// reports one.
 	Cancel(gid string) error
+	// AddMagnet queues a BitTorrent magnet download in opts.Dir and
+	// returns the GID of the metadata download. Its completion event
+	// carries the GID of the download that holds the real files in
+	// FollowedBy.
+	AddMagnet(magnetURI string, opts *engine.AddOptions) (string, error)
 
 	// Status returns the current snapshot of one download.
 	Status(gid string) (engine.DownloadInfo, error)
+
+	// Cancel removes a queued or active download. An unknown GID reports
+	// an error that matches engine.ErrNotFound.
+	Cancel(gid string) error
 
 	// Events returns the lifecycle event stream for all downloads.
 	Events() (<-chan engine.Event, func())
@@ -64,6 +77,11 @@ type Config struct {
 
 	// FilteredDomains lists the blocked domain substrings.
 	FilteredDomains []string
+
+	// FilteredFilenames lists the blocked file-name substrings. The filter
+	// applies with case-sensitive substring matching once the real file
+	// name of a download becomes known.
+	FilteredFilenames []string
 
 	// StatusUpdateInterval is the delay between two status message updates.
 	StatusUpdateInterval time.Duration
@@ -145,11 +163,15 @@ type record struct {
 	username        string
 	repliedUsername string
 	started         time.Time
+	// tar marks a /mirrorTar request whose directory result is archived
+	// before publication.
+	tar bool
 
 	mu              sync.Mutex
 	downloadStarted bool
 	uploading       bool
 	cancelNotified  bool
+	blocked         bool
 	uploadedBytes   int64
 	lastUploadBytes int64
 	lastUploadCheck time.Time
@@ -186,7 +208,7 @@ func (r *record) hasStarted() bool {
 	return r.downloadStarted
 }
 
-// isUploading reports whether the result is being published now.
+// isUploading reports whether the record's result is being uploaded.
 func (r *record) isUploading() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -207,6 +229,20 @@ func (r *record) cancelNotifiedChat() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.cancelNotified
+}
+
+// setBlocked marks the record's download as stopped by the file-name filter.
+func (r *record) setBlocked() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.blocked = true
+}
+
+// isBlocked reports whether the file-name filter stopped this download.
+func (r *record) isBlocked() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.blocked
 }
 
 // setUploadedBytes records upload progress.
@@ -291,6 +327,7 @@ func (s *Service) Run(ctx context.Context) error {
 			s.handleEvent(ctx, ev)
 		case <-ticker.C:
 			if s.trackedCount() > 0 {
+				s.enforceFilenameFilters(ctx)
 				s.refreshStatuses()
 			}
 		}
@@ -312,12 +349,12 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 	}
 
 	switch command {
-	case "mirror":
+	case "mirror", "mirrortar":
 		if !s.isAuthorized(msg) {
 			s.sendTemporaryReply(ctx, msg, unauthorizedMessage)
 			return
 		}
-		s.handleMirror(ctx, msg, arg)
+		s.handleMirror(ctx, msg, arg, command == "mirrortar")
 	case "start":
 		// The upstream command set accepts no argument for these commands.
 		if arg != "" {
@@ -352,8 +389,10 @@ func (s *Service) HandleUpdate(ctx context.Context, upd telegram.Update) {
 	}
 }
 
-// handleMirror accepts an HTTP(S) mirror request.
-func (s *Service) handleMirror(ctx context.Context, msg *telegram.Message, url string) {
+// handleMirror accepts a mirror request. The input is an HTTP(S) URL, a URL
+// for a remote torrent file, or a BitTorrent magnet link. A tar request
+// archives a directory result before publication.
+func (s *Service) handleMirror(ctx context.Context, msg *telegram.Message, url string, tar bool) {
 	if url == "" {
 		// The upstream bot ignores a mirror command without a URL.
 		return
@@ -372,12 +411,19 @@ func (s *Service) handleMirror(ctx context.Context, msg *telegram.Message, url s
 		username:        renderedUsername(msg),
 		repliedUsername: renderedUsername(msg.ReplyToMessage),
 		started:         time.Now(),
+		tar:             tar,
 	}
 
 	// Hold the record lock while the download is added, so an event that
 	// arrives during AddURL cannot run before the record exists.
 	s.recMu.Lock()
-	gid, err := s.dl.AddURL(url, &engine.AddOptions{Dir: rec.dir})
+	var gid string
+	var err error
+	if isMagnetURI(url) {
+		gid, err = s.dl.AddMagnet(url, &engine.AddOptions{Dir: rec.dir})
+	} else {
+		gid, err = s.dl.AddURL(url, &engine.AddOptions{Dir: rec.dir})
+	}
 	if err != nil {
 		s.recMu.Unlock()
 		message := fmt.Sprintf("Failed to start the download. %v", err)
@@ -575,13 +621,14 @@ func (s *Service) handleEvent(ctx context.Context, ev engine.Event) {
 	case engine.EventStart:
 		rec.markStarted()
 		log.Printf("mirror: gid %s started. Dir %s", ev.GID, rec.dir)
+		s.enforceFilenameFilters(ctx)
 		s.refreshStatuses()
 	case engine.EventComplete:
 		go s.handleComplete(ctx, rec)
 	case engine.EventError:
 		go s.handleFailure(ctx, rec)
 	case engine.EventStop:
-		go s.finish(ctx, rec, "Download stopped.")
+		go s.finish(ctx, rec, stoppedMessage(rec))
 	default:
 		// Pause and BitTorrent events belong to later feature work.
 	}
@@ -595,18 +642,50 @@ func (s *Service) handleComplete(ctx context.Context, rec *record) {
 		s.finish(ctx, rec, "Upload failed. Could not get downloaded files.")
 		return
 	}
-	if len(info.FollowedBy) > 0 || len(info.Files) == 0 || info.Files[0].Path == "" {
-		// Torrent metadata and fileless completions carry nothing to publish.
+	if len(info.FollowedBy) > 0 {
+		// A torrent metadata download completed; the followed download
+		// holds the real files and needs the record's attention.
+		s.followDownload(ctx, rec, info.FollowedBy[0])
+		return
+	}
+	if len(info.Files) == 0 || info.Files[0].Path == "" {
+		// Fileless completions carry nothing to publish.
 		s.finish(ctx, rec, "Upload failed. Could not get files.")
 		return
 	}
 
 	root := downloadRoot(info)
+	if strings.HasSuffix(root, ".torrent") {
+		// The engine follows torrent metadata with a child download. A
+		// completed metadata file without a child carries no publishable
+		// result.
+		s.finish(ctx, rec, "Upload failed. Could not get files.")
+		return
+	}
 	name := filepath.Base(root)
 	size := info.TotalLength
 
 	rec.setUploading(true)
 	s.refreshStatuses()
+
+	if s.filenameDisallowed(name) {
+		log.Printf("mirror: gid %s blacklisted. Filename %s", rec.gid, name)
+		s.finish(ctx, rec, "Upload failed. Blacklisted file name.")
+		return
+	}
+
+	if rec.tar {
+		archivedPath, archivedSize, err := archiveResult(root)
+		if err != nil {
+			log.Printf("mirror: gid %s archive: %v", rec.gid, err)
+			s.finish(ctx, rec, fmt.Sprintf("Failed to upload <code>%s.tar</code> to Drive. %v", name, err))
+			return
+		}
+		if archivedPath != root {
+			log.Printf("mirror: gid %s archived %s", rec.gid, archivedPath)
+			root, name, size = archivedPath, name+".tar", archivedSize
+		}
+	}
 
 	log.Printf("mirror: gid %s completed. Filename %s. Starting upload", rec.gid, name)
 	result, err := s.pub.Publish(ctx, root, func(pr drive.Progress) {
@@ -625,6 +704,47 @@ func (s *Service) handleComplete(ctx context.Context, rec *record) {
 		message += "\n\n<i>Folders in Shared Drives can only be shared with members of the drive. Mirror as an archive if you need public links.</i>"
 	}
 	s.finish(ctx, rec, message)
+}
+
+// followDownload moves a record from a completed torrent metadata download
+// onto the followed download that holds the real files. The followed download
+// may already be complete while the metadata event was processed, so its
+// status is checked to keep the result from being lost.
+func (s *Service) followDownload(ctx context.Context, rec *record, childGID string) {
+	log.Printf("mirror: gid %s changed to %s", rec.gid, childGID)
+
+	s.recMu.Lock()
+	if tracked, exists := s.records[childGID]; exists && tracked != rec {
+		s.recMu.Unlock()
+		return
+	}
+	delete(s.records, rec.gid)
+	rec.gid = childGID
+	s.records[childGID] = rec
+	s.recMu.Unlock()
+
+	child, err := s.dl.Status(childGID)
+	if err != nil {
+		// The followed download is not known yet; its events drive it.
+		return
+	}
+	switch child.Status {
+	case engine.StatusComplete:
+		s.handleComplete(ctx, rec)
+	case engine.StatusError:
+		s.handleFailure(ctx, rec)
+	case engine.StatusRemoved:
+		s.finish(ctx, rec, stoppedMessage(rec))
+	}
+}
+
+// stoppedMessage renders the reply for a stopped download. A download stopped
+// by the file-name filter says so, like the upstream bot.
+func stoppedMessage(rec *record) string {
+	if rec.isBlocked() {
+		return "Download stopped. Blacklisted file name."
+	}
+	return "Download stopped."
 }
 
 // handleFailure reports a failed download with the engine error details.
@@ -752,6 +872,67 @@ func (s *Service) isDownloadAllowed(url string) bool {
 		}
 	}
 	return true
+}
+
+// filenameDisallowed reports whether name contains a blocked file-name
+// substring. The filter is a case-sensitive substring check, like the
+// upstream bot. An empty name or an undetermined torrent metadata name is
+// never blocked, because the real file name is not known yet.
+func (s *Service) filenameDisallowed(name string) bool {
+	if name == "" || name == "Metadata" {
+		return false
+	}
+	for _, filtered := range s.cfg.FilteredFilenames {
+		if strings.Contains(name, filtered) {
+			return true
+		}
+	}
+	return false
+}
+
+// enforceFilenameFilters stops tracked downloads whose real file name became
+// known and is blocked, like the upstream bot does on every status update.
+// A download whose upload already started is left alone; the completion path
+// prevents publication instead.
+func (s *Service) enforceFilenameFilters(ctx context.Context) {
+	if len(s.cfg.FilteredFilenames) == 0 {
+		return
+	}
+
+	s.recMu.Lock()
+	recs := make([]*record, 0, len(s.records))
+	for _, rec := range s.records {
+		recs = append(recs, rec)
+	}
+	s.recMu.Unlock()
+
+	for _, rec := range recs {
+		if rec.isUploading() || rec.isBlocked() {
+			continue
+		}
+		info, err := s.dl.Status(rec.gid)
+		if err != nil {
+			continue
+		}
+		name := downloadName(info, rec.url)
+		if !s.filenameDisallowed(name) {
+			continue
+		}
+		log.Printf("mirror: gid %s blacklisted. Filename %s", rec.gid, name)
+		rec.setBlocked()
+		if cancelErr := s.dl.Cancel(rec.gid); cancelErr != nil && !errors.Is(cancelErr, engine.ErrNotFound) {
+			log.Printf("mirror: cancel gid %s: %v", rec.gid, cancelErr)
+		}
+		// Finish directly: the engine may not report the removal, and a
+		// late stop event finds no record and changes nothing.
+		s.finish(ctx, rec, stoppedMessage(rec))
+	}
+}
+
+// isMagnetURI reports whether an input is a BitTorrent magnet link. The
+// magnet scheme is matched without case sensitivity, like aria2.
+func isMagnetURI(input string) bool {
+	return strings.HasPrefix(strings.ToLower(input), "magnet:")
 }
 
 // sendTemporaryReply replies to a command message and removes both messages

@@ -170,7 +170,7 @@ func TestMirrorCommandMatching(t *testing.T) {
 		{name: "uppercase", text: "/MIRROR " + mirrorURL, accepted: true},
 		{name: "mixed case", text: "/Mirror " + mirrorURL, accepted: true},
 		{name: "any suffix allowed when name not required", text: "/mirror@somebot " + mirrorURL, accepted: true},
-		{name: "wrong command", text: "/mirrorTar " + mirrorURL, accepted: false},
+		{name: "wrong command", text: "/mirrorX " + mirrorURL, accepted: false},
 		{name: "name required in group", useName: true, chatType: "group", text: "/mirror " + mirrorURL, accepted: false},
 		{name: "configured name accepted in group", useName: true, chatType: "group", text: "/mirror@telemirror_bot " + mirrorURL, accepted: true},
 		{name: "configured name matches without case", useName: true, chatType: "group", text: "/mirror@TeLeMirror_Bot " + mirrorURL, accepted: true},
